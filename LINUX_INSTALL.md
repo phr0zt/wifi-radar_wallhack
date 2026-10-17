@@ -80,19 +80,37 @@ sudo python3 wifi_radar_linux.py
 
 ## WiFi Scanning Methods
 
-WiFi Radar supports two methods for scanning WiFi networks:
+WiFi Radar supports three methods for scanning WiFi networks, tried in order.
 
-### Method 1: NetworkManager (nmcli) - Recommended
-- **Pros:** No sudo required, faster, more reliable
-- **Cons:** Requires NetworkManager to be running
+### Method 1: `iw scan` - Recommended, run with sudo
+- **Pros:** The only method that actually re-scans the band on every pass, so
+  signal readings are fresh. Reports real dBm.
+- **Cons:** Needs root, and one sweep takes about 4-5 seconds.
+- **Test:** `sudo iw dev <interface> scan`
+
+### Method 2: NetworkManager (nmcli) - Fallback, no sudo
+- **Pros:** No sudo required.
+- **Cons:** **Readings are stale.** `nmcli dev wifi` reads NetworkManager's
+  cache, which only refreshes every couple of minutes. Between refreshes every
+  AP except the one you are connected to is frozen, and then they all jump at
+  once. Motion detection is poor and false alarms are common. `--rescan yes`
+  does not help; NetworkManager throttles it.
 - **Test:** `nmcli dev wifi`
 
-### Method 2: wireless-tools (iwlist) - Fallback
-- **Pros:** Works without NetworkManager
-- **Cons:** Requires root/sudo, slower
+### Method 3: wireless-tools (iwlist) - Last resort
+- **Pros:** Works without NetworkManager.
+- **Cons:** Requires root/sudo, slower.
 - **Test:** `sudo iwlist scanning`
 
-The script automatically detects which method to use.
+The script automatically detects which method to use. **Run it with sudo** for
+the real-scan path:
+
+```bash
+sudo python3 wifi_radar_linux.py
+```
+
+Without root it still runs, but falls back to the cached NetworkManager
+readings described above.
 
 ---
 

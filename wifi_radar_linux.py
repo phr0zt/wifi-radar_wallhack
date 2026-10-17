@@ -14,6 +14,51 @@ from tkinter import ttk
 import threading
 import math
 
+# --- Detection tuning -------------------------------------------------------
+# nmcli reports signal as 0-100%, iwlist as negative dBm. Each knob is given
+# in both units and picked by the sign of the reading, measured on this box:
+# -75 dBm lands around 42% on nmcli's scale.
+MIN_SIGNAL_DBM = -75   # weaker APs swing on noise alone, so they never vote
+MIN_SIGNAL_PCT = 42
+DEVIATION_DBM = 5      # a body moving shifts a nearby AP by more than this
+DEVIATION_PCT = 10     # nmcli's percent jitters ~7 points at rest, so 5 is noise
+MOTION_QUORUM = 3      # APs that must move together before it counts as motion
+SCAN_INTERVAL = 5      # seconds; a real band sweep takes ~4.5s, so 2s cannot work
+
+
+def wifi_interface():
+    """First wifi interface that is actually up, so disabled cards are skipped."""
+    try:
+        out = subprocess.run(['iw', 'dev'], capture_output=True,
+                             text=True, timeout=5).stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    for line in out.split('\n'):
+        line = line.strip()
+        if line.startswith('Interface '):
+            name = line.split(None, 1)[1]
+            try:
+                with open('/sys/class/net/%s/operstate' % name) as fh:
+                    if fh.read().strip() == 'up':
+                        return name
+            except OSError:
+                continue
+    return None
+
+
+def _is_dbm(signal):
+    """iwlist gives negative dBm, nmcli gives a 0-100 percentage."""
+    return signal < 0
+
+
+def strong_enough(signal):
+    return signal >= (MIN_SIGNAL_DBM if _is_dbm(signal) else MIN_SIGNAL_PCT)
+
+
+def deviation_threshold(signal):
+    return DEVIATION_DBM if _is_dbm(signal) else DEVIATION_PCT
+
+
 class WiFiRadarLinux:
     def __init__(self):
         self.root = tk.Tk()
@@ -26,7 +71,7 @@ class WiFiRadarLinux:
         self.baseline = {}
         self.scan_count = 0
         self.alert_count = 0
-        self.baseline_scans = 20  # 40 seconds at 2s intervals
+        self.baseline_scans = 12  # ~60 seconds at SCAN_INTERVAL
         self.scan_history = defaultdict(list)
         self.alert_aps = set()
         
@@ -136,7 +181,35 @@ class WiFiRadarLinux:
         """Scan WiFi networks using nmcli or iwlist"""
         aps = {}
         
-        # Try nmcli first (NetworkManager)
+        # A real scan first. nmcli only reads NetworkManager's cache, which
+        # refreshes every couple of minutes: every AP but the connected one
+        # sits frozen and then they all jump at once, which is useless for
+        # motion and trips any threshold at the same instant. `iw scan` sweeps
+        # the band for real and reports dBm, but it needs root.
+        iface = wifi_interface()
+        if iface:
+            try:
+                result = subprocess.run(['sudo', '-n', 'iw', 'dev', iface, 'scan'],
+                                        capture_output=True, text=True, timeout=30)
+                if result.returncode == 0:
+                    bssid = None
+                    for line in result.stdout.split('\n'):
+                        line = line.strip()
+                        if line.startswith('BSS '):
+                            bssid = line[4:21]
+                            aps[bssid] = {'ssid': '(hidden)', 'bssid': bssid,
+                                          'signal': -100}
+                        elif bssid and line.startswith('signal:'):
+                            aps[bssid]['signal'] = float(line.split()[1])
+                        elif bssid and line.startswith('SSID:'):
+                            aps[bssid]['ssid'] = line[5:].strip() or '(hidden)'
+                    if aps:
+                        return aps
+            except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
+                aps = {}
+
+        # Fallback: NetworkManager's cache. No root needed, but the readings
+        # are stale, so motion detection will be poor.
         try:
             result = subprocess.run(['nmcli', '-t', '-f', 'SSID,BSSID,SIGNAL', 'dev', 'wifi'],
                                   capture_output=True, text=True, timeout=5)
@@ -225,23 +298,25 @@ class WiFiRadarLinux:
         
     def scan_loop(self):
         while self.monitoring:
+            started = time.time()
             aps = self.scan_wifi()
             
             if not aps:
                 self.log("Failed to scan WiFi. Check permissions (may need sudo).", 'warning')
-                time.sleep(2)
+                time.sleep(SCAN_INTERVAL)
                 continue
                 
             self.scan_count += 1
             
             # Update stats
-            self.root.after(0, self.update_stats, len(aps))
+            tracked = sum(1 for a in aps.values() if strong_enough(a['signal']))
+            self.root.after(0, self.update_stats, tracked)
             
             # Build baseline
             if self.scan_count <= self.baseline_scans:
                 for bssid, ap in aps.items():
-                    if bssid not in self.scan_history:
-                        self.scan_history[bssid] = []
+                    if not strong_enough(ap['signal']):
+                        continue
                     self.scan_history[bssid].append(ap['signal'])
                     
                 progress = int((self.scan_count / self.baseline_scans) * 100)
@@ -259,26 +334,24 @@ class WiFiRadarLinux:
                     self.log(f"Baseline established. Tracking {len(self.baseline)} APs.")
                     
             else:
-                # Detect motion
-                motion_detected = False
-                affected_aps = []
-                
+                # Detect motion. A weak AP swings several points from noise
+                # alone, so only APs above the floor get a vote, and several
+                # must move in the same scan before this calls it motion.
+                deviating = []
+
                 for bssid, ap in aps.items():
-                    if bssid in self.baseline:
-                        deviation = abs(ap['signal'] - self.baseline[bssid])
-                        
-                        # ponytail: nmcli reports signal as 0-100%, not dBm,
-                        # so this threshold is in percent points. Tune it here
-                        # if the radar is too twitchy or too deaf.
-                        if deviation > 5:
-                            motion_detected = True
-                            affected_aps.append(ap['ssid'])
-                            self.alert_aps.add(bssid)
-                        elif bssid in self.alert_aps:
-                            # Decay alert
-                            self.alert_aps.discard(bssid)
-                
-                if motion_detected and len(affected_aps) >= 2:
+                    if bssid not in self.baseline:
+                        continue
+                    if not strong_enough(ap['signal']):
+                        continue
+                    deviation = abs(ap['signal'] - self.baseline[bssid])
+                    if deviation > deviation_threshold(ap['signal']):
+                        deviating.append((bssid, ap['ssid']))
+
+                self.alert_aps = {bssid for bssid, _ in deviating}
+                affected_aps = [ssid for _, ssid in deviating]
+
+                if len(deviating) >= MOTION_QUORUM:
                     self.alert_count += 1
                     self.root.after(0, lambda: 
                                   self.status_label.config(text="⚠️ MOTION DETECTED", fg='#ff4444'))
@@ -289,7 +362,8 @@ class WiFiRadarLinux:
                                   self.status_label.config(text="MONITORING", fg='#00ff88') 
                                   if self.monitoring else None)
             
-            time.sleep(2)
+            # A real sweep already burned most of the interval.
+            time.sleep(max(0, SCAN_INTERVAL - (time.time() - started)))
             
     def update_stats(self, ap_count):
         self.scan_label.value_label.config(text=str(self.scan_count))
